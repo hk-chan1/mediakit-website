@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import os
 import uuid
 import asyncio
 import shutil
 from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,9 +50,9 @@ class UrlRequest(BaseModel):
 class JobStatus(BaseModel):
     job_id: str
     status: str
-    stage: str | None = None
-    error: str | None = None
-    midi_data: dict | None = None
+    stage: Optional[str] = None
+    error: Optional[str] = None
+    midi_data: Optional[dict] = None
 
 
 def get_job_dir(job_id: str) -> Path:

@@ -1,303 +1,462 @@
+"""
+Sheet-music PDF generation.
+
+Primary path: LilyPond (professional engraving quality).
+Fallback: ReportLab basic PDF.
+Fallback-of-fallback: minimal hand-crafted PDF.
+
+The LilyPond generator handles:
+  - Separate treble / bass voices from the piano arranger
+  - Chord notation  (<c e g>4)
+  - Automatic rest-filling between notes
+  - Correct key signature (from Krumhansl–Schmuckler)
+  - Tempo marking
+  - Measure numbers every 4 bars
+  - Dynamics derived from MIDI velocity
+"""
+
 import subprocess
 import os
 import tempfile
+import shutil
+import logging
 from pathlib import Path
+from typing import List, Optional
 
-NOTE_NAMES_SHARP = ["c", "cis", "d", "dis", "e", "f", "fis", "g", "gis", "a", "ais", "b"]
+logger = logging.getLogger(__name__)
+
+# ── LilyPond note naming ──────────────────────────────────────────────────────
+_NAMES_SHARP = ["c","cis","d","dis","e","f","fis","g","gis","a","ais","b"]
+_NAMES_FLAT  = ["c","des","d","ees","e","f","ges","g","aes","a","bes","b"]
+
+# Keys that conventionally use flats
+_FLAT_KEY_ROOTS = {3, 5, 8, 10}   # Eb, F, Ab, Bb
+
 KEY_SIG_MAP = {
-    0: "c \\major",
-    1: "des \\major",
-    2: "d \\major",
-    3: "ees \\major",
-    4: "e \\major",
-    5: "f \\major",
-    6: "fis \\major",
-    7: "g \\major",
-    8: "aes \\major",
-    9: "a \\major",
-    10: "bes \\major",
-    11: "b \\major",
+    0: "c \\major",  1: "des \\major", 2: "d \\major",   3: "ees \\major",
+    4: "e \\major",  5: "f \\major",   6: "fis \\major",  7: "g \\major",
+    8: "aes \\major",9: "a \\major",  10: "bes \\major", 11: "b \\major",
 }
 
-
-def midi_to_lilypond_note(pitch: int) -> str:
-    """Convert MIDI pitch to LilyPond note name."""
-    octave = (pitch // 12) - 1
-    note_name = NOTE_NAMES_SHARP[pitch % 12]
-
-    # LilyPond: c' = C4 (MIDI 60), c'' = C5, c = C3, c, = C2
-    lily_octave = octave - 3  # relative to LilyPond's middle reference
-    if lily_octave > 0:
-        note_name += "'" * lily_octave
-    elif lily_octave < 0:
-        note_name += "," * abs(lily_octave)
-
-    return note_name
+# (beats, lily-duration-string) — longest first for greedy decomposition
+_RHYTHMIC_VALUES = [
+    (4.0, "1"),   (3.0, "2."),  (2.0, "2"),   (1.5, "4."),
+    (1.0, "4"),   (0.75,"8."),  (0.5, "8"),   (0.375,"16."),
+    (0.25,"16"),  (0.125,"32"),
+]
 
 
-def quantize_duration(duration_sec: float, tempo: int) -> str:
-    """Convert a duration in seconds to a LilyPond duration string."""
-    beat_duration = 60.0 / tempo  # seconds per beat
-
-    beats = duration_sec / beat_duration
-
-    if beats >= 3.5:
-        return "1"
-    elif beats >= 2.5:
-        return "2."
-    elif beats >= 1.5:
-        return "2"
-    elif beats >= 1.0:
-        return "4"
-    elif beats >= 0.5:
-        return "8"
-    elif beats >= 0.25:
-        return "16"
-    else:
-        return "16"
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Public entry point
+# ──────────────────────────────────────────────────────────────────────────────
 
 def generate_sheet_music_pdf(midi_data: dict, output_path: str):
-    """Generate a PDF piano sheet music from MIDI data using LilyPond."""
-    notes = midi_data["notes"]
-    tempo = midi_data["tempo"]
-    time_sig = midi_data["timeSignature"]
-    key_sig = midi_data.get("keySignature", 0)
+    """Generate a piano-score PDF from the pipeline output dict."""
+    # Prefer explicit treble/bass split from the arranger
+    treble_notes = midi_data.get("treble_notes") or [
+        n for n in midi_data["notes"] if n["pitch"] >= 60
+    ]
+    bass_notes = midi_data.get("bass_notes") or [
+        n for n in midi_data["notes"] if n["pitch"] < 60
+    ]
 
-    # Split into treble (>= 60 / C4) and bass (< 60)
-    treble_notes = [n for n in notes if n["pitch"] >= 60]
-    bass_notes = [n for n in notes if n["pitch"] < 60]
+    tempo      = float(midi_data.get("tempo", 120))
+    time_sig   = midi_data.get("timeSignature", [4, 4])
+    key_sig    = int(midi_data.get("keySignature", 0))
+    use_flats  = key_sig in _FLAT_KEY_ROOTS
 
-    def notes_to_lilypond(note_list: list, max_notes: int = 200) -> str:
-        if not note_list:
-            return "r1"  # whole rest
+    lily_src = _build_lilypond(
+        treble_notes, bass_notes, tempo, time_sig, key_sig, use_flats
+    )
 
-        lily_notes = []
-        for n in note_list[:max_notes]:
-            name = midi_to_lilypond_note(n["pitch"])
-            dur = quantize_duration(n["duration"], tempo)
-            lily_notes.append(f"{name}{dur}")
+    try:
+        _render_lilypond(lily_src, output_path)
+        return
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.warning(f"LilyPond unavailable or failed ({e}). "
+                       "Falling back to ReportLab.")
 
-        return " ".join(lily_notes)
+    _generate_reportlab(midi_data, treble_notes, bass_notes, output_path)
 
-    treble_str = notes_to_lilypond(treble_notes)
-    bass_str = notes_to_lilypond(bass_notes)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LilyPond source construction
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_lilypond(treble_notes: list, bass_notes: list,
+                    tempo: float, time_sig: list,
+                    key_sig: int, use_flats: bool) -> str:
     key_lily = KEY_SIG_MAP.get(key_sig, "c \\major")
+    tempo_int = max(40, min(240, int(round(tempo))))
 
-    lilypond_source = f"""\\version "2.24.0"
+    treble_voice = _notes_to_voice(
+        treble_notes, tempo, time_sig, use_flats, max_notes=500)
+    bass_voice = _notes_to_voice(
+        bass_notes, tempo, time_sig, use_flats, max_notes=500)
+
+    # Measure-number rehearsal marks every 4 bars
+    measure_marks = _build_measure_marks(treble_notes, tempo, time_sig)
+
+    return f"""\\version "2.24.0"
 
 \\header {{
   title = "Transcribed Piano Sheet Music"
   subtitle = "Generated by MediaKit"
-  tagline = "Automatically transcribed from video audio"
+  tagline = "Automatically transcribed · tempo {tempo_int} BPM"
 }}
 
 \\paper {{
   #(set-paper-size "letter")
-  top-margin = 15\\mm
+  top-margin    = 15\\mm
   bottom-margin = 15\\mm
-  left-margin = 15\\mm
-  right-margin = 15\\mm
+  left-margin   = 15\\mm
+  right-margin  = 15\\mm
+}}
+
+trebleMusic = {{
+  \\clef treble
+  \\key {key_lily}
+  \\time {time_sig[0]}/{time_sig[1]}
+  \\tempo 4 = {tempo_int}
+  {measure_marks}
+  {treble_voice}
+  \\bar "|."
+}}
+
+bassMusic = {{
+  \\clef bass
+  \\key {key_lily}
+  \\time {time_sig[0]}/{time_sig[1]}
+  {bass_voice}
+  \\bar "|."
 }}
 
 \\score {{
   \\new PianoStaff <<
-    \\new Staff = "treble" {{
-      \\clef treble
-      \\key {key_lily}
-      \\time {time_sig[0]}/{time_sig[1]}
-      \\tempo 4 = {tempo}
-      {treble_str}
-    }}
-    \\new Staff = "bass" {{
-      \\clef bass
-      \\key {key_lily}
-      \\time {time_sig[0]}/{time_sig[1]}
-      {bass_str}
-    }}
+    \\new Staff \\trebleMusic
+    \\new Staff \\bassMusic
   >>
-  \\layout {{ }}
+  \\layout {{
+    \\context {{
+      \\Score
+      \\override BarNumber.break-visibility = #end-of-line-invisible
+      barNumberVisibility = #(every-nth-bar-number-visible 4)
+    }}
+  }}
   \\midi {{ }}
 }}
 """
 
-    # Try LilyPond first
-    try:
-        _generate_with_lilypond(lilypond_source, output_path)
-        return
-    except (FileNotFoundError, RuntimeError):
-        pass
 
-    # Fallback: generate PDF with reportlab
-    _generate_with_reportlab(midi_data, output_path)
+def _build_measure_marks(notes: list, tempo: float, time_sig: list) -> str:
+    """Generate \\mark commands at every 4th bar boundary."""
+    if not notes:
+        return ""
+    beat_dur = 60.0 / tempo
+    measure_dur = time_sig[0] * beat_dur
+    if measure_dur <= 0:
+        return ""
+
+    last_time = max(n["startTime"] for n in notes)
+    total_measures = int(last_time / measure_dur) + 1
+
+    marks = []
+    for bar in range(0, total_measures + 1, 4):
+        if bar == 0:
+            continue
+        pos_beats = bar * time_sig[0]
+        marks.append(f"\\skip 1*0  % bar {bar}")
+    return ""   # LilyPond's automatic bar numbers (every-nth) are enough
 
 
-def _generate_with_lilypond(source: str, output_path: str):
-    """Generate PDF using LilyPond."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ly_path = os.path.join(tmpdir, "score.ly")
+# ──────────────────────────────────────────────────────────────────────────────
+# Voice builder: notes → LilyPond string
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _notes_to_voice(note_list: list, tempo: float, time_sig: list,
+                    use_flats: bool, max_notes: int = 500) -> str:
+    """
+    Convert a list of note dicts to a single LilyPond voice string.
+    Simultaneous notes are grouped as chords; gaps are filled with rests.
+    """
+    if not note_list:
+        return "R1*4"   # 4 measures of multi-measure rest
+
+    beat_dur = 60.0 / tempo
+    note_list = sorted(note_list, key=lambda n: (n["startTime"], n["pitch"]))
+    note_list = note_list[:max_notes]
+
+    # Group simultaneous notes into chord events
+    events = _build_events(note_list, beat_dur)
+
+    parts: List[str] = []
+    cursor_beats = 0.0
+
+    for ev in events:
+        t_beats = ev["t_beats"]
+
+        # Fill gap with rests
+        gap = t_beats - cursor_beats
+        if gap >= 0.124:   # at least ~32nd note
+            parts.extend(_beats_to_rests(gap))
+        cursor_beats = t_beats
+
+        dur_str = _beats_to_lily_dur(ev["dur_beats"])
+        pitches = ev["pitches"]
+
+        if len(pitches) == 1:
+            parts.append(f"{_midi_to_lily(pitches[0], use_flats)}{dur_str}")
+        else:
+            names = " ".join(_midi_to_lily(p, use_flats) for p in pitches)
+            parts.append(f"<{names}>{dur_str}")
+
+        # Optionally add a dynamic marking based on velocity
+        vel = ev.get("velocity", 80)
+        dyn = _velocity_to_dynamic(vel)
+        if dyn and len(parts) > 0:
+            parts[-1] += f"\\{dyn}"
+
+        cursor_beats = t_beats + ev["dur_beats"]
+
+    return " ".join(parts) if parts else "R1*4"
+
+
+def _build_events(note_list: list, beat_dur: float) -> list:
+    """Group notes into (time, [pitches], duration) event records."""
+    events = []
+    i = 0
+    while i < len(note_list):
+        t = note_list[i]["startTime"]
+        grp = []
+        j = i
+        while j < len(note_list) and abs(note_list[j]["startTime"] - t) < 0.05:
+            grp.append(note_list[j])
+            j += 1
+
+        dur_beats = _snap_to_standard(
+            max(0.125, grp[0]["duration"] / beat_dur)
+        )
+        events.append({
+            "t_beats": t / beat_dur,
+            "dur_beats": dur_beats,
+            "pitches": sorted({n["pitch"] for n in grp}),
+            "velocity": int(sum(n.get("velocity", 80) for n in grp) / len(grp)),
+        })
+        i = j
+    return events
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Duration helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _snap_to_standard(beats: float) -> float:
+    standard = [v for v, _ in _RHYTHMIC_VALUES]
+    return min(standard, key=lambda v: abs(v - beats))
+
+
+def _beats_to_lily_dur(beats: float) -> str:
+    best = min(_RHYTHMIC_VALUES, key=lambda rv: abs(rv[0] - beats))
+    return best[1]
+
+
+def _beats_to_rests(beats: float) -> List[str]:
+    """Decompose a beat count into a list of rest strings."""
+    rests = []
+    remaining = beats
+    for bval, lstr in _RHYTHMIC_VALUES:
+        while remaining >= bval - 0.01:
+            rests.append(f"r{lstr}")
+            remaining -= bval
+            if remaining < 0.01:
+                break
+    return rests or ["r16"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pitch / dynamics helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _midi_to_lily(pitch: int, use_flats: bool = False) -> str:
+    names = _NAMES_FLAT if use_flats else _NAMES_SHARP
+    note = names[pitch % 12]
+    lily_octave = (pitch // 12) - 1 - 3    # c' = MIDI 60
+    if lily_octave > 0:
+        note += "'" * lily_octave
+    elif lily_octave < 0:
+        note += "," * abs(lily_octave)
+    return note
+
+
+def _velocity_to_dynamic(vel: int) -> Optional[str]:
+    """Map MIDI velocity to a LilyPond dynamic string (used sparingly)."""
+    if vel >= 112:  return "ff"
+    if vel >= 96:   return "f"
+    if vel >= 64:   return "mf"
+    if vel >= 48:   return "mp"
+    if vel >= 32:   return "p"
+    return "pp"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LilyPond renderer
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _render_lilypond(source: str, output_path: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        ly_path = os.path.join(tmp, "score.ly")
         with open(ly_path, "w") as f:
             f.write(source)
 
-        cmd = [
-            "lilypond",
-            "--pdf",
-            f"--output={tmpdir}",
-            ly_path,
-        ]
+        result = subprocess.run(
+            ["lilypond", "--pdf", f"--output={tmp}", ly_path],
+            capture_output=True, text=True, timeout=180,
+        )
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        pdf = os.path.join(tmp, "score.pdf")
+        if not Path(pdf).exists():
+            raise RuntimeError(f"LilyPond failed: {result.stderr[-600:]}")
 
-        pdf_file = os.path.join(tmpdir, "score.pdf")
-        if not Path(pdf_file).exists():
-            raise RuntimeError(f"LilyPond failed: {result.stderr[:500]}")
-
-        # Copy to output
-        import shutil
-        shutil.copy2(pdf_file, output_path)
+        shutil.copy2(pdf, output_path)
 
 
-def _generate_with_reportlab(midi_data: dict, output_path: str):
-    """Fallback PDF generation using reportlab (basic but works without LilyPond)."""
+# ──────────────────────────────────────────────────────────────────────────────
+# ReportLab fallback
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _generate_reportlab(midi_data: dict, treble_notes: list,
+                         bass_notes: list, output_path: str):
     try:
         from reportlab.lib.pagesizes import letter
-        from reportlab.pdfgen import canvas
+        from reportlab.pdfgen import canvas as rl_canvas
         from reportlab.lib.units import inch
     except ImportError:
-        # If reportlab not available, create a minimal text-based PDF
         _generate_minimal_pdf(midi_data, output_path)
         return
 
-    c = canvas.Canvas(output_path, pagesize=letter)
-    width, height = letter
+    NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    tempo      = midi_data.get("tempo", 120)
+    time_sig   = midi_data.get("timeSignature", [4, 4])
+    key_name   = NOTE_NAMES[int(midi_data.get("keySignature", 0))]
 
-    # Title
-    c.setFont("Helvetica-Bold", 24)
-    c.drawCentredString(width / 2, height - 1 * inch, "Piano Sheet Music")
+    c = rl_canvas.Canvas(output_path, pagesize=letter)
+    w, h = letter
 
-    c.setFont("Helvetica", 12)
-    c.drawCentredString(width / 2, height - 1.4 * inch, "Generated by MediaKit")
-
-    # Music info
-    y = height - 2 * inch
+    c.setFont("Helvetica-Bold", 22)
+    c.drawCentredString(w/2, h - inch, "Piano Sheet Music")
     c.setFont("Helvetica", 11)
-    notes = midi_data["notes"]
-    tempo = midi_data["tempo"]
-    time_sig = midi_data["timeSignature"]
+    c.drawCentredString(w/2, h - 1.4*inch, "Generated by MediaKit")
 
-    NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-    key_name = NOTE_NAMES[midi_data.get("keySignature", 0)]
+    y = h - 2*inch
+    c.setFont("Helvetica", 10)
+    c.drawString(inch, y,
+                 f"Tempo: {tempo:.0f} BPM    "
+                 f"Time: {time_sig[0]}/{time_sig[1]}    "
+                 f"Key: {key_name} Major    "
+                 f"Notes: {len(treble_notes)} treble / {len(bass_notes)} bass")
+    y -= 0.5*inch
 
-    c.drawString(1 * inch, y, f"Tempo: {tempo} BPM    Time Signature: {time_sig[0]}/{time_sig[1]}    Key: {key_name} Major")
-    y -= 0.3 * inch
-    c.drawString(1 * inch, y, f"Total notes detected: {len(notes)}")
-    y -= 0.5 * inch
-
-    # Draw staff lines
-    treble_notes = [n for n in notes if n["pitch"] >= 60]
-    bass_notes = [n for n in notes if n["pitch"] < 60]
-
-    def draw_staff(canvas_obj, x_start, y_pos, label):
-        canvas_obj.setFont("Helvetica-Bold", 10)
-        canvas_obj.drawString(x_start, y_pos + 0.15 * inch, label)
+    def draw_staff(label, staff_y):
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(inch, staff_y + 0.18*inch, label)
         for i in range(5):
-            line_y = y_pos - i * 0.1 * inch
-            canvas_obj.setLineWidth(0.5)
-            canvas_obj.line(x_start + 0.6 * inch, line_y, width - 1 * inch, line_y)
+            ly2 = staff_y - i*0.12*inch
+            c.setLineWidth(0.5)
+            c.line(inch + 0.7*inch, ly2, w - inch, ly2)
 
-    def draw_notes_on_staff(canvas_obj, note_list, x_start, y_pos, max_notes=40):
-        if not note_list:
+    def plot_notes(nlist, staff_y, max_n=50):
+        if not nlist:
             return
-        staff_width = width - 1 * inch - (x_start + 0.6 * inch)
-        display_notes = note_list[:max_notes]
-        spacing = staff_width / (len(display_notes) + 1)
+        disp = nlist[:max_n]
+        x0 = inch + 0.7*inch
+        available = w - inch - x0
+        spacing = available / (len(disp) + 1)
+        for i, n in enumerate(disp):
+            nx = x0 + spacing*(i+1)
+            pc = n["pitch"] % 12
+            note_y = staff_y - 0.2*inch + (pc/12)*0.48*inch
+            c.setFillColorRGB(0.2, 0.1, 0.7)
+            c.circle(nx, note_y, 3, fill=1)
+            name = NOTE_NAMES[pc]
+            oct_n = (n["pitch"]//12) - 1
+            c.setFont("Helvetica", 5)
+            c.setFillColorRGB(0.4, 0.4, 0.4)
+            c.drawCentredString(nx, note_y - 9, f"{name}{oct_n}")
+            c.setFillColorRGB(0, 0, 0)
 
-        for i, note in enumerate(display_notes):
-            x = x_start + 0.6 * inch + spacing * (i + 1)
-            # Map pitch to vertical position on staff
-            pitch = note["pitch"]
-            # Rough mapping: each staff line is 0.1 inch apart
-            note_offset = ((pitch % 12) / 12.0) * 0.4 * inch
-            note_y = y_pos - 0.2 * inch + note_offset
-            canvas_obj.setFillColorRGB(0.3, 0.1, 0.6)
-            canvas_obj.circle(x, note_y, 3, fill=1)
+    draw_staff("Treble (Right Hand)", y)
+    plot_notes(treble_notes, y)
+    y -= 1.4*inch
 
-            # Note name below
-            note_name = NOTE_NAMES[pitch % 12]
-            octave = (pitch // 12) - 1
-            canvas_obj.setFont("Helvetica", 5)
-            canvas_obj.setFillColorRGB(0.4, 0.4, 0.4)
-            canvas_obj.drawCentredString(x, note_y - 10, f"{note_name}{octave}")
-            canvas_obj.setFillColorRGB(0, 0, 0)
-
-    # Treble staff
-    draw_staff(c, 1 * inch, y, "Treble")
-    draw_notes_on_staff(c, treble_notes, 1 * inch, y)
-
-    y -= 1.2 * inch
-
-    # Bass staff
-    draw_staff(c, 1 * inch, y, "Bass")
-    draw_notes_on_staff(c, bass_notes, 1 * inch, y)
-
-    y -= 1.5 * inch
+    draw_staff("Bass (Left Hand)", y)
+    plot_notes(bass_notes, y)
+    y -= 1.6*inch
 
     # Note list
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(1 * inch, y, "Detected Notes (first 60):")
-    y -= 0.3 * inch
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(inch, y, "Detected Notes (first 60):")
+    y -= 0.3*inch
     c.setFont("Courier", 8)
 
-    for i, note in enumerate(notes[:60]):
-        if y < 1 * inch:
+    all_notes = sorted(treble_notes + bass_notes,
+                       key=lambda n: n["startTime"])
+    for n in all_notes[:60]:
+        if y < inch:
             c.showPage()
-            y = height - 1 * inch
+            y = h - inch
             c.setFont("Courier", 8)
-
-        note_name = NOTE_NAMES[note["pitch"] % 12]
-        octave = (note["pitch"] // 12) - 1
-        c.drawString(
-            1 * inch,
-            y,
-            f"{note_name}{octave:<4}  Start: {note['startTime']:.2f}s  Duration: {note['duration']:.2f}s  Velocity: {note['velocity']}",
-        )
-        y -= 0.18 * inch
+        name = NOTE_NAMES[n["pitch"] % 12]
+        oct_n = (n["pitch"]//12) - 1
+        hand = "R" if n.get("_src") in ("vocal", None) or n["pitch"] >= 60 else "L"
+        c.drawString(inch, y,
+                     f"[{hand}] {name}{oct_n:<4}  "
+                     f"Start: {n['startTime']:.2f}s  "
+                     f"Dur: {n['duration']:.2f}s  "
+                     f"Vel: {n.get('velocity',80)}")
+        y -= 0.17*inch
 
     c.save()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Minimal PDF fallback (no external deps)
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _generate_minimal_pdf(midi_data: dict, output_path: str):
-    """Absolute minimal PDF generation without any extra dependencies."""
-    notes = midi_data["notes"]
-    NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    treble = midi_data.get("treble_notes",
+                           [n for n in midi_data["notes"] if n["pitch"] >= 60])
+    bass   = midi_data.get("bass_notes",
+                           [n for n in midi_data["notes"] if n["pitch"] < 60])
 
     lines = [
-        "Piano Sheet Music - Generated by MediaKit",
-        f"Tempo: {midi_data['tempo']} BPM",
-        f"Time Signature: {midi_data['timeSignature'][0]}/{midi_data['timeSignature'][1]}",
-        f"Total notes: {len(notes)}",
-        "",
-        "Treble (Right Hand):",
+        "Piano Sheet Music — Generated by MediaKit",
+        f"Tempo: {midi_data.get('tempo',120):.0f} BPM",
+        f"Time Signature: {midi_data.get('timeSignature',[4,4])[0]}/"
+        f"{midi_data.get('timeSignature',[4,4])[1]}",
+        f"Key: {NOTE_NAMES[int(midi_data.get('keySignature',0))]} Major",
+        "", "Treble (Right Hand):",
     ]
-
-    for n in [n for n in notes if n["pitch"] >= 60][:50]:
+    for n in treble[:50]:
         name = NOTE_NAMES[n["pitch"] % 12]
-        octave = (n["pitch"] // 12) - 1
-        lines.append(f"  {name}{octave} at {n['startTime']:.2f}s (dur: {n['duration']:.2f}s)")
-
-    lines.append("")
-    lines.append("Bass (Left Hand):")
-    for n in [n for n in notes if n["pitch"] < 60][:50]:
+        oct_n = (n["pitch"]//12) - 1
+        lines.append(f"  {name}{oct_n} at {n['startTime']:.2f}s "
+                     f"(dur {n['duration']:.2f}s)")
+    lines += ["", "Bass (Left Hand):"]
+    for n in bass[:50]:
         name = NOTE_NAMES[n["pitch"] % 12]
-        octave = (n["pitch"] // 12) - 1
-        lines.append(f"  {name}{octave} at {n['startTime']:.2f}s (dur: {n['duration']:.2f}s)")
+        oct_n = (n["pitch"]//12) - 1
+        lines.append(f"  {name}{oct_n} at {n['startTime']:.2f}s "
+                     f"(dur {n['duration']:.2f}s)")
 
-    text = "\n".join(lines)
+    text_ops = b"BT /F1 9 Tf 50 750 Td 12 TL\n"
+    for line in lines[:70]:
+        safe = (line.replace("\\","\\\\")
+                    .replace("(","\\(").replace(")","\\)"))
+        text_ops += f"({safe}) '\n".encode("latin-1", errors="replace")
+    text_ops += b"ET"
 
-    # Minimal valid PDF
-    content = text.encode("latin-1", errors="replace")
-    stream = (
+    pre = (
         b"%PDF-1.4\n"
         b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
         b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
@@ -305,27 +464,22 @@ def _generate_minimal_pdf(midi_data: dict, output_path: str):
         b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
         b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Courier>>endobj\n"
     )
-
-    # Build text stream
-    text_ops = b"BT /F1 9 Tf 72 750 Td 12 TL\n"
-    for line in lines[:70]:
-        safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        text_ops += f"({safe}) '\n".encode("latin-1", errors="replace")
-    text_ops += b"ET"
-
-    stream_obj = f"4 0 obj<</Length {len(text_ops)}>>stream\n".encode()
-    stream_obj += text_ops + b"\nendstream\nendobj\n"
-
-    pdf = stream + stream_obj
-    xref_pos = len(pdf)
-    pdf += b"xref\n0 6\n"
-    pdf += b"0000000000 65535 f \n"
-    pdf += b"0000000009 00000 n \n"
-    pdf += b"0000000058 00000 n \n"
-    pdf += b"0000000115 00000 n \n"
-    pdf += f"{len(stream):010d} 00000 n \n".encode()
-    pdf += b"0000000300 00000 n \n"
-    pdf += f"trailer<</Size 6/Root 1 0 R>>\nstartxref\n{xref_pos}\n%%EOF".encode()
-
+    stream_obj = (
+        f"4 0 obj<</Length {len(text_ops)}>>stream\n".encode()
+        + text_ops
+        + b"\nendstream\nendobj\n"
+    )
+    pdf = pre + stream_obj
+    xref = len(pdf)
+    pdf += (
+        b"xref\n0 6\n"
+        b"0000000000 65535 f \n"
+        b"0000000009 00000 n \n"
+        b"0000000058 00000 n \n"
+        b"0000000115 00000 n \n"
+        + f"{len(pre):010d} 00000 n \n".encode()
+        + b"0000000300 00000 n \n"
+        + f"trailer<</Size 6/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF".encode()
+    )
     with open(output_path, "wb") as f:
         f.write(pdf)

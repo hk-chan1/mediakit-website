@@ -1,9 +1,39 @@
+# Web framework
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
-basic-pitch==0.3.3
-midiutil==1.2.1
-numpy>=1.23.0
-yt-dlp==2024.3.10
 pydantic==2.6.4
 aiofiles==23.2.1
+
+# Audio download
+yt-dlp>=2025.1.0
+
+# ── Core audio / transcription ────────────────────────────────────────────────
+numpy>=1.23.0
+
+# Polyphonic instrument transcription
+basic-pitch==0.3.3
+
+# Audio I/O (required by stem_transcriber + beat_grid)
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# ── Source separation ─────────────────────────────────────────────────────────
+# Demucs requires PyTorch — install PyTorch CPU build first to keep image size
+# manageable; GPU users can swap to the CUDA wheel.
+torch>=2.0.0
+torchaudio>=2.0.0
+demucs>=4.0.0
+
+# ── Monophonic pitch detection (CREPE) ───────────────────────────────────────
+# Optional; stem_transcriber falls back to librosa pYIN if unavailable.
+crepe>=0.0.13
+
+# ── Beat tracking ─────────────────────────────────────────────────────────────
+# madmom may require Cython; install that first in Dockerfile.
+# beat_grid.py falls back to librosa if madmom is unavailable.
+madmom>=0.16.1
+
+# ── PDF fallback ─────────────────────────────────────────────────────────────
+reportlab>=4.0.0
+midiutil==1.2.1

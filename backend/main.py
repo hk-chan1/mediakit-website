@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from services.audio_extractor import extract_audio_from_file, extract_audio_from_url
-from services.transcriber import transcribe_audio
+from services.transcriber import run_full_pipeline
 from services.sheet_generator import generate_sheet_music_pdf
 
 TEMP_DIR = Path("temp")
@@ -62,17 +62,26 @@ def get_job_dir(job_id: str) -> Path:
 
 
 async def process_job(job_id: str, audio_path: str):
-    """Background task that runs the full pipeline."""
+    """Background task that runs the full 5-stage pipeline."""
     try:
-        # Stage 2: Transcribe audio to MIDI
-        jobs[job_id]["stage"] = "analyzing"
-        midi_data = await asyncio.to_thread(transcribe_audio, audio_path)
+        job_dir = get_job_dir(job_id)
+
+        # Stage callback — called from the worker thread; GIL makes this safe
+        def update_stage(stage: str):
+            jobs[job_id]["stage"] = stage
+
+        # Stages 1–4: source separation → transcription → quantisation → arrangement
+        midi_data = await asyncio.to_thread(
+            run_full_pipeline,
+            audio_path,
+            str(job_dir),
+            update_stage,
+        )
 
         jobs[job_id]["midi_data"] = midi_data
 
-        # Stage 3: Generate sheet music PDF
+        # Stage 5: engrave sheet music PDF
         jobs[job_id]["stage"] = "generating"
-        job_dir = get_job_dir(job_id)
         pdf_path = str(job_dir / "sheet_music.pdf")
         await asyncio.to_thread(generate_sheet_music_pdf, midi_data, pdf_path)
 

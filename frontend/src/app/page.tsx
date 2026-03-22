@@ -73,7 +73,7 @@ export default function HomePage() {
   );
 
   const handleFileUpload = async (file: File) => {
-    setStage("extracting");
+    setStage("extracting" as ProcessingStage);
     setError(undefined);
     setMidiData(null);
     setPdfReady(false);
@@ -102,7 +102,7 @@ export default function HomePage() {
   };
 
   const handleUrlSubmit = async (url: string) => {
-    setStage("extracting");
+    setStage("extracting" as ProcessingStage);
     setError(undefined);
     setMidiData(null);
     setPdfReady(false);

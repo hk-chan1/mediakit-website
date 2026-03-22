@@ -12,8 +12,7 @@ def extract_audio_from_file(video_path: str, output_dir: str) -> str:
         "-i", video_path,
         "-vn",                    # No video
         "-acodec", "pcm_s16le",   # WAV format
-        "-ar", "22050",           # Sample rate (good for pitch detection)
-        "-ac", "1",               # Mono
+        "-ar", "44100",           # 44100 Hz — required for Demucs source separation
         "-y",                     # Overwrite
         output_path,
     ]
@@ -38,7 +37,7 @@ def extract_audio_from_url(url: str, output_dir: str) -> str:
         "--no-playlist",
         "--extract-audio",
         "--audio-format", "wav",
-        "--postprocessor-args", "-ar 22050 -ac 1",
+        "--postprocessor-args", "ffmpeg:-ar 44100",
         "--output", os.path.join(output_dir, "audio.%(ext)s"),
         "--max-filesize", "500M",
         url,

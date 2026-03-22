@@ -166,7 +166,10 @@ def _finish(vocals_notes, bass_notes, instrument_notes,
     stage("quantizing", {"stage_timings": timings})
     t0 = time.time()
     from services.beat_grid import detect_beat_grid, quantize_notes_to_grid
-    beat_grid = detect_beat_grid(proc_audio)
+
+    # Pass all transcribed notes as hints so tempo scoring can use them
+    notes_hint = vocals_notes + bass_notes + instrument_notes
+    beat_grid = detect_beat_grid(proc_audio, notes_hint=notes_hint if notes_hint else None)
     logger.info(
         f"Tempo: {beat_grid['tempo']:.1f} BPM  "
         f"{beat_grid['timeSignature'][0]}/{beat_grid['timeSignature'][1]}"
@@ -181,6 +184,16 @@ def _finish(vocals_notes, bass_notes, instrument_notes,
     from services.piano_arranger import arrange_for_piano, detect_key_signature
     arr = arrange_for_piano(vocals_notes, bass_notes, instrument_notes)
     treble, bass = arr["treble"], arr["bass"]
+
+    # Post-process: merge close notes, smooth contour, fill bass, fix repetitions
+    try:
+        from services.post_processor import post_process_notes
+        treble, bass = post_process_notes(
+            treble, bass, beat_grid["tempo"], beat_grid["timeSignature"]
+        )
+    except Exception as e:
+        logger.warning(f"Post-processing failed ({e}) — using unprocessed notes")
+
     key_sig = detect_key_signature(treble + bass)
     timings["arranging"] = round(time.time() - t0, 1)
 

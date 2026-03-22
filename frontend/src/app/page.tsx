@@ -9,9 +9,11 @@ import { UrlInput } from "@/components/url-input";
 import { ProgressTracker, type ProcessingStage } from "@/components/progress-tracker";
 import { SheetMusicPreview } from "@/components/sheet-music-preview";
 import { HowItWorks } from "@/components/how-it-works";
-import { Download, RotateCcw, Music } from "lucide-react";
+import { Download, RotateCcw, Music, Zap, Layers, Star } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+type Mode = "quick" | "auto" | "quality";
 
 interface MidiData {
   notes: Array<{ pitch: number; startTime: number; duration: number; velocity: number }>;
@@ -20,78 +22,97 @@ interface MidiData {
   keySignature: number;
 }
 
+const MODE_OPTIONS: { value: Mode; label: string; desc: string; Icon: any }[] = [
+  { value: "quick",   label: "Quick",   desc: "Solo instrument, fastest",   Icon: Zap },
+  { value: "auto",    label: "Auto",    desc: "Smart tier selection",        Icon: Layers },
+  { value: "quality", label: "Quality", desc: "Full separation, most accurate", Icon: Star },
+];
+
 export default function HomePage() {
   const [stage, setStage] = useState<ProcessingStage | null>(null);
   const [error, setError] = useState<string | undefined>();
   const [jobId, setJobId] = useState<string | null>(null);
   const [midiData, setMidiData] = useState<MidiData | null>(null);
   const [pdfReady, setPdfReady] = useState(false);
+  const [mode, setMode] = useState<Mode>("auto");
 
-  const pollStatus = useCallback(
-    async (id: string) => {
-      const maxAttempts = 120; // 10 minutes max
-      let attempts = 0;
+  // Tier info received progressively from status polling
+  const [tier, setTier] = useState<number | null>(null);
+  const [tierReason, setTierReason] = useState<string | null>(null);
+  const [estimatedSeconds, setEstimatedSeconds] = useState<number | null>(null);
+  const [stageTimings, setStageTimings] = useState<Record<string, number> | null>(null);
 
-      const poll = async () => {
-        if (attempts >= maxAttempts) {
-          setError("Processing timed out. The video may be too long or complex.");
+  const pollStatus = useCallback(async (id: string) => {
+    const maxAttempts = 200;  // 10 minutes at 3s intervals
+    let attempts = 0;
+
+    const poll = async () => {
+      if (attempts >= maxAttempts) {
+        setError("Processing timed out. The video may be too long or complex.");
+        setStage("error");
+        return;
+      }
+      attempts++;
+
+      try {
+        const res = await fetch(`${API_BASE}/api/status/${id}`);
+        if (!res.ok) throw new Error("Failed to check status");
+        const data = await res.json();
+
+        if (data.status === "error") {
+          setError(data.error || "An unexpected error occurred.");
           setStage("error");
           return;
         }
-        attempts++;
 
-        try {
-          const res = await fetch(`${API_BASE}/api/status/${id}`);
-          if (!res.ok) throw new Error("Failed to check status");
+        setStage(data.stage as ProcessingStage);
+        if (data.tier != null)             setTier(data.tier);
+        if (data.tier_reason)              setTierReason(data.tier_reason);
+        if (data.estimated_seconds != null) setEstimatedSeconds(data.estimated_seconds);
+        if (data.stage_timings)            setStageTimings(data.stage_timings);
 
-          const data = await res.json();
-
-          if (data.status === "error") {
-            setError(data.error || "An unexpected error occurred.");
-            setStage("error");
-            return;
-          }
-
-          setStage(data.stage as ProcessingStage);
-
-          if (data.status === "done") {
-            setMidiData(data.midi_data);
-            setPdfReady(true);
-            return;
-          }
-
-          setTimeout(poll, 3000);
-        } catch {
-          setError("Lost connection to server. Please try again.");
-          setStage("error");
+        if (data.status === "done") {
+          setMidiData(data.midi_data);
+          setPdfReady(true);
+          return;
         }
-      };
 
-      poll();
-    },
-    []
-  );
+        setTimeout(poll, 3000);
+      } catch {
+        setError("Lost connection to server. Please try again.");
+        setStage("error");
+      }
+    };
 
-  const handleFileUpload = async (file: File) => {
-    setStage("extracting" as ProcessingStage);
+    poll();
+  }, []);
+
+  const startProcessing = () => {
+    setStage("extracting");
     setError(undefined);
     setMidiData(null);
     setPdfReady(false);
+    setTier(null);
+    setTierReason(null);
+    setEstimatedSeconds(null);
+    setStageTimings(null);
+  };
 
+  const handleFileUpload = async (file: File) => {
+    startProcessing();
     try {
       const formData = new FormData();
       formData.append("file", file);
+      formData.append("mode", mode);
 
       const res = await fetch(`${API_BASE}/api/process/upload`, {
         method: "POST",
         body: formData,
       });
-
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || "Upload failed");
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e.detail || "Upload failed");
       }
-
       const data = await res.json();
       setJobId(data.job_id);
       pollStatus(data.job_id);
@@ -102,23 +123,17 @@ export default function HomePage() {
   };
 
   const handleUrlSubmit = async (url: string) => {
-    setStage("extracting" as ProcessingStage);
-    setError(undefined);
-    setMidiData(null);
-    setPdfReady(false);
-
+    startProcessing();
     try {
       const res = await fetch(`${API_BASE}/api/process/url`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, mode }),
       });
-
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || "Failed to process URL");
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e.detail || "Failed to process URL");
       }
-
       const data = await res.json();
       setJobId(data.job_id);
       pollStatus(data.job_id);
@@ -129,9 +144,7 @@ export default function HomePage() {
   };
 
   const handleDownload = () => {
-    if (jobId) {
-      window.open(`${API_BASE}/api/download/${jobId}`, "_blank");
-    }
+    if (jobId) window.open(`${API_BASE}/api/download/${jobId}`, "_blank");
   };
 
   const handleReset = () => {
@@ -140,6 +153,10 @@ export default function HomePage() {
     setJobId(null);
     setMidiData(null);
     setPdfReady(false);
+    setTier(null);
+    setTierReason(null);
+    setEstimatedSeconds(null);
+    setStageTimings(null);
   };
 
   const isProcessing = stage !== null && stage !== "done" && stage !== "error";
@@ -158,8 +175,8 @@ export default function HomePage() {
           <span className="text-primary">Piano Sheet Music</span>
         </h1>
         <p className="text-lg text-muted-foreground max-w-xl mx-auto">
-          Upload a video or paste a link. Our AI extracts the music, detects notes and chords, and generates
-          downloadable piano sheet music in PDF format.
+          Upload a video or paste a link. AI separates the audio sources, detects every note,
+          and generates downloadable piano sheet music in PDF format.
         </p>
       </section>
 
@@ -172,21 +189,54 @@ export default function HomePage() {
           </CardHeader>
           <CardContent>
             {stage === null ? (
-              <Tabs defaultValue="upload" className="w-full">
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="upload">Upload Video</TabsTrigger>
-                  <TabsTrigger value="url">Paste URL</TabsTrigger>
-                </TabsList>
-                <TabsContent value="upload" className="mt-4">
-                  <UploadZone onFileSelected={handleFileUpload} />
-                </TabsContent>
-                <TabsContent value="url" className="mt-4">
-                  <UrlInput onUrlSubmit={handleUrlSubmit} />
-                </TabsContent>
-              </Tabs>
+              <div className="space-y-5">
+                {/* Mode selector */}
+                <div>
+                  <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">
+                    Processing mode
+                  </p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {MODE_OPTIONS.map(({ value, label, desc, Icon }) => (
+                      <button
+                        key={value}
+                        onClick={() => setMode(value)}
+                        className={`flex flex-col items-center gap-1 rounded-lg border p-3 text-center transition-all text-sm ${
+                          mode === value
+                            ? "border-primary bg-primary/5 text-primary"
+                            : "border-muted hover:border-primary/40 text-muted-foreground"
+                        }`}
+                      >
+                        <Icon className="h-4 w-4" />
+                        <span className="font-medium">{label}</span>
+                        <span className="text-xs opacity-70 leading-tight">{desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <Tabs defaultValue="upload" className="w-full">
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="upload">Upload Video</TabsTrigger>
+                    <TabsTrigger value="url">Paste URL</TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="upload" className="mt-4">
+                    <UploadZone onFileSelected={handleFileUpload} />
+                  </TabsContent>
+                  <TabsContent value="url" className="mt-4">
+                    <UrlInput onUrlSubmit={handleUrlSubmit} />
+                  </TabsContent>
+                </Tabs>
+              </div>
             ) : (
               <div className="space-y-6">
-                <ProgressTracker stage={stage} error={error} />
+                <ProgressTracker
+                  stage={stage}
+                  error={error}
+                  tier={tier}
+                  tierReason={tierReason}
+                  estimatedSeconds={estimatedSeconds}
+                  stageTimings={stageTimings}
+                />
 
                 {midiData && <SheetMusicPreview midiData={midiData} />}
 
@@ -215,7 +265,6 @@ export default function HomePage() {
         </Card>
       </section>
 
-      {/* How It Works */}
       <div id="how-it-works">
         <HowItWorks />
       </div>

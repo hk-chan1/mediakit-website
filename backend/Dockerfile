@@ -56,13 +56,13 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# ── Pre-download Demucs model weights ────────────────────────────────────────
-RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs_ft')" \
+# ── Pre-download Demucs model weights (htdemucs base — faster than ft) ───────
+RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs')" \
     || echo "Demucs model pre-download failed — will download on first use"
 
 COPY . .
 
-RUN mkdir -p temp
+RUN mkdir -p temp cache
 
 EXPOSE 8000
 

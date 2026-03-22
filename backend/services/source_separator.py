@@ -1,3 +1,13 @@
+"""
+Demucs audio source separation.
+
+Optimisations vs. the previous version:
+  - Uses htdemucs (base model) instead of htdemucs_ft — faster, good enough
+  - Auto-detects GPU and passes --device accordingly
+  - 120-second hard timeout; raises RuntimeError on expiry (caller falls back)
+  - --segment 30 for chunked, lower-memory processing
+"""
+
 import subprocess
 import os
 import logging
@@ -5,67 +15,81 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_DEMUCS_TIMEOUT = 120   # seconds before we give up and fall back
+
 
 def separate_audio_sources(audio_path: str, output_dir: str) -> dict:
     """
-    Separate audio into stems (vocals, bass, other) using Demucs htdemucs_ft.
-    Drums are discarded.  Falls back to the original mix if Demucs is
-    unavailable or fails.
+    Separate audio into vocals, bass, other stems using Demucs htdemucs.
+    Drums are discarded.
 
-    Returns a dict mapping stem name → absolute file path.
+    Falls back to {"other": audio_path} if Demucs is unavailable or times out.
+    Raises RuntimeError (with explanatory message) so the caller can fall back.
     """
-    logger.info("Stage 1: Separating audio sources with Demucs htdemucs_ft...")
-    try:
-        return _run_demucs(audio_path, output_dir)
-    except Exception as e:
-        logger.warning(f"Demucs unavailable or failed ({e}). "
-                       "Using full mix for instrument transcription.")
-        return {"other": audio_path}
+    logger.info("Separating audio sources with Demucs htdemucs…")
+    return _run_demucs(audio_path, output_dir)
 
 
 def _run_demucs(audio_path: str, output_dir: str) -> dict:
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"  Demucs device: {device}")
+
     stems_dir = os.path.join(output_dir, "stems")
     os.makedirs(stems_dir, exist_ok=True)
 
     cmd = [
         "python", "-m", "demucs",
-        "--name", "htdemucs_ft",
+        "--name", "htdemucs",       # base model — faster than htdemucs_ft
         "--out", stems_dir,
+        "--device", device,
+        "--segment", "30",          # 30-second chunks: lower memory, predictable time
+        "--overlap", "0.1",
         audio_path,
     ]
 
-    logger.info(f"  Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+    logger.info(f"  CMD: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_DEMUCS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Demucs timed out after {_DEMUCS_TIMEOUT}s — "
+            "falling back to direct transcription"
+        )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Demucs failed (exit {result.returncode}): "
-                           f"{result.stderr[-600:]}")
+        raise RuntimeError(
+            f"Demucs exit {result.returncode}: {result.stderr[-400:]}"
+        )
 
-    # Demucs outputs to: {stems_dir}/htdemucs_ft/{audio_stem}/{part}.wav
-    audio_stem = Path(audio_path).stem
-    model_out = Path(stems_dir) / "htdemucs_ft"
-
-    # Locate the per-track directory (might be 'audio' or a sanitised name)
+    # Output layout: {stems_dir}/htdemucs/{track_stem}/{part}.wav
+    model_out = Path(stems_dir) / "htdemucs"
     track_dirs = list(model_out.glob("*")) if model_out.exists() else []
     if not track_dirs:
-        raise RuntimeError(
-            f"Demucs ran but produced no output under {model_out}")
+        raise RuntimeError(f"Demucs ran but produced no output under {model_out}")
 
+    # Pick the best-matching track dir
+    audio_stem = Path(audio_path).stem
     track_dir = track_dirs[0]
-    if len(track_dirs) > 1:
-        # Pick the best match by name
-        matches = [d for d in track_dirs if d.name == audio_stem]
-        if matches:
-            track_dir = matches[0]
+    for d in track_dirs:
+        if d.name == audio_stem:
+            track_dir = d
+            break
 
     stems: dict = {}
     for stem_name in ("vocals", "bass", "other"):
-        stem_path = track_dir / f"{stem_name}.wav"
-        if stem_path.exists():
-            stems[stem_name] = str(stem_path)
-            logger.info(f"  ✓ {stem_name}: {stem_path.name}")
+        p = track_dir / f"{stem_name}.wav"
+        if p.exists():
+            stems[stem_name] = str(p)
+            logger.info(f"  ✓ {stem_name}")
         else:
-            logger.warning(f"  ✗ {stem_name} stem not found at {stem_path}")
+            logger.warning(f"  ✗ {stem_name} not found")
 
     if not stems:
         raise RuntimeError("Demucs produced no usable stems")

@@ -76,7 +76,7 @@ def transcribe_polyphonic_stem(audio_path: str) -> List[dict]:
             model_or_model_path=ICASSP_2022_MODEL_PATH,
             onset_threshold=onset_t,
             frame_threshold=frame_t,
-            minimum_note_length=58,
+            minimum_note_length=40,   # allow 40ms notes to catch fast runs
             midi_tempo=120,
         )
         return evs
@@ -96,13 +96,13 @@ def transcribe_polyphonic_stem(audio_path: str) -> List[dict]:
             })
         return out
 
-    # Pass 1 — standard thresholds
-    notes = _events_to_notes(_run_predict(0.5, 0.3))
+    # Pass 1 — lowered onset threshold for legato piano (catches soft stepwise attacks)
+    notes = _events_to_notes(_run_predict(0.3, 0.2))
     logger.info(f"  Pass 1: {len(notes)} notes")
 
-    # Pass 2 — sensitive thresholds, keep only bass notes (pitch < 57)
+    # Pass 2 — extra sensitive thresholds, keep only bass notes (pitch < 57)
     try:
-        bass_candidates = _events_to_notes(_run_predict(0.3, 0.2))
+        bass_candidates = _events_to_notes(_run_predict(0.2, 0.15))
         bass_only = [n for n in bass_candidates if n["pitch"] < 57]
 
         # Deduplicate: drop if a pass-1 note covers the same pitch & time

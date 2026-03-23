@@ -92,9 +92,9 @@ def _build_lilypond(treble_notes: list, bass_notes: list,
     tempo_int = max(40, min(240, int(round(tempo))))
 
     treble_voice = _notes_to_voice(
-        treble_notes, tempo, time_sig, use_flats, max_notes=500)
+        treble_notes, tempo, time_sig, use_flats, max_notes=500, add_breaks=True)
     bass_voice = _notes_to_voice(
-        bass_notes, tempo, time_sig, use_flats, max_notes=500)
+        bass_notes, tempo, time_sig, use_flats, max_notes=500, add_breaks=False)
 
     safe_title = title.replace('"', "'")
 
@@ -139,8 +139,8 @@ bassMusic = {{
   \\layout {{
     \\context {{
       \\Score
-      \\override BarNumber.break-visibility = #end-of-line-invisible
-      barNumberVisibility = #(every-nth-bar-number-visible 4)
+      \\override BarNumber.break-visibility = ##(#f #f #t)
+      barNumberVisibility = #all-bar-numbers-visible
     }}
   }}
   \\midi {{ }}
@@ -154,12 +154,14 @@ bassMusic = {{
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _notes_to_voice(note_list: list, tempo: float, time_sig: list,
-                    use_flats: bool, max_notes: int = 500) -> str:
+                    use_flats: bool, max_notes: int = 500,
+                    add_breaks: bool = False) -> str:
     """
     Convert a list of note dicts to a single LilyPond voice string.
     Simultaneous notes are grouped as chords; gaps are filled with rests.
     Dynamics are applied once per 4-bar phrase (not per note).
-    A \\break is inserted after every 4th bar for 4-bars-per-system layout.
+    \\break is inserted after every 4th bar ONLY in the treble voice (add_breaks=True)
+    so that both staves break together in the PianoStaff without conflicting breaks.
     """
     if not note_list:
         return "R1*4"   # 4 measures of multi-measure rest
@@ -204,11 +206,12 @@ def _notes_to_voice(note_list: list, tempo: float, time_sig: list,
 
         cursor_beats = t_beats + ev["dur_beats"]
 
-        # Insert \break after every 4th bar
-        cur_measure = int(cursor_beats / measure_dur_beats)
-        if cur_measure > last_break_measure and cur_measure % 4 == 0:
-            parts.append("\\break")
-            last_break_measure = cur_measure
+        # Insert \break only in treble — PianoStaff propagates it to bass
+        if add_breaks:
+            cur_measure = int(cursor_beats / measure_dur_beats)
+            if cur_measure > last_break_measure and cur_measure % 4 == 0:
+                parts.append("\\break")
+                last_break_measure = cur_measure
 
     return " ".join(parts) if parts else "R1*4"
 

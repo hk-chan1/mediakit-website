@@ -3,8 +3,8 @@ Tempo / beat-grid detection and rhythmic quantisation.
 
 Fix 1: Tempo doubling problem
   Many trackers lock onto sub-beat pulses and report 2× or 1.5× the true tempo.
-  We generate multiple tempo hypotheses (T, T/2, T×2/3, T×3/4) and score each
-  against note-onset alignment if notes are available.
+  We generate multiple tempo hypotheses from ratio scaling AND from note IOIs,
+  then score each by onset alignment + strong-beat density + musicality.
 
 Fix 1b: Time-signature detection
   DBNDownBeatTrackingProcessor now considers [2, 3, 4, 6] beats per bar.
@@ -149,29 +149,55 @@ def _detect_librosa(audio_path: str, notes_hint: Optional[List[dict]]) -> dict:
 def _pick_best_tempo(candidates: list, beats: list, time_sig: list,
                      notes_hint: Optional[List[dict]], raw_tempo: float) -> float:
     """
-    Score each tempo candidate against note-onset alignment and musical
-    duration distribution. Return the best candidate.
+    Score each tempo candidate against note-onset alignment, strong-beat density,
+    and musical duration distribution. Also adds IOI-derived candidates from notes.
     """
     if not notes_hint or len(notes_hint) < 4:
         return raw_tempo   # can't validate; trust raw detection
 
-    beats_arr = np.array(beats) if beats else np.array([])
+    # ── Add IOI-derived tempo candidates from actual note inter-onset intervals ──
+    sorted_notes = sorted(notes_hint, key=lambda n: n["startTime"])
+    iois = []
+    for i in range(len(sorted_notes) - 1):
+        ioi = sorted_notes[i + 1]["startTime"] - sorted_notes[i]["startTime"]
+        if 0.08 < ioi < 2.0:
+            iois.append(ioi)
+
+    extra_candidates: set = set()
+    if iois:
+        med_ioi = float(np.median(iois))
+        for mult in [1, 2, 3, 4]:
+            t = 60.0 / (med_ioi * mult)
+            if 40 <= t <= 220:
+                extra_candidates.add(round(t, 2))
+
+    all_candidates = sorted(set(candidates) | extra_candidates)
 
     def score(tempo: float) -> float:
         beat_dur = 60.0 / tempo
+        measure_dur = time_sig[0] * beat_dur
 
-        # ── Alignment: how many note onsets land near a beat subdivision ──
+        # ── 16th-note alignment ───────────────────────────────────────────────
         align_scores = []
         for n in notes_hint:
             t = n["startTime"]
-            # Distance to nearest 16th note
             sub = beat_dur / 4
             offset = t % sub
             dist = min(offset, sub - offset) / sub     # 0=perfect, 0.5=worst
             align_scores.append(1.0 - 2 * dist)
         align = float(np.mean(align_scores))
 
-        # ── Musicality: prefer tempos where note durations are "standard" ──
+        # ── Strong-beat density: notes landing on beat 1 of each measure ─────
+        # Correct tempo → melody has clear downbeats; doubled tempo → beat 1 is
+        # musically mid-bar and fewer notes fall there.
+        beat1_count = 0
+        for n in notes_hint:
+            pos = n["startTime"] % measure_dur
+            if pos < beat_dur * 0.35 or pos > measure_dur - beat_dur * 0.35:
+                beat1_count += 1
+        beat1_density = beat1_count / max(len(notes_hint), 1)
+
+        # ── Musicality: note durations map to standard rhythmic values ────────
         dur_scores = []
         std_beats = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
         for n in notes_hint:
@@ -181,19 +207,29 @@ def _pick_best_tempo(candidates: list, beats: list, time_sig: list,
             dur_scores.append(max(0.0, 1.0 - dev))
         musicality = float(np.mean(dur_scores))
 
-        # ── Range preference: human performance range ──────────────────────
-        range_ok = 1.0 if 50 <= tempo <= 200 else 0.6
+        # ── Range preference: typical human performance ───────────────────────
+        range_ok = 1.0 if 50 <= tempo <= 160 else 0.5
 
-        # ── Prefer candidates close to the raw detection (less aggressive) ─
+        # ── Weak proximity to raw (tiny bias, easily overridden) ─────────────
         proximity = 1.0 / (1.0 + abs(tempo - raw_tempo) / max(raw_tempo, 1))
 
-        return 0.45 * align + 0.30 * musicality + 0.15 * range_ok + 0.10 * proximity
+        return (0.38 * align + 0.30 * beat1_density +
+                0.20 * musicality + 0.07 * range_ok + 0.05 * proximity)
 
-    scored = [(t, score(t)) for t in candidates]
+    scored = [(t, score(t)) for t in all_candidates]
     scored.sort(key=lambda x: -x[1])
 
-    logger.debug(f"  Tempo hypotheses: { {round(t,1): round(s,3) for t,s in scored[:5]} }")
-    return scored[0][0]
+    best = scored[0][0]
+
+    # ── Hard sanity: 3/4 waltz above 160 BPM is almost certainly doubled ─────
+    if time_sig == [3, 4] and best > 160:
+        halved = best / 2.0
+        logger.info(f"  Tempo {best:.1f} > 160 in 3/4 — auto-halving to {halved:.1f}")
+        best = halved
+
+    logger.debug(f"  Tempo hypotheses: { {round(t,1): round(s,3) for t,s in scored[:6]} }")
+    logger.info(f"  Raw tempo {raw_tempo:.1f} → chosen {best:.1f} BPM")
+    return best
 
 
 # ──────────────────────────────────────────────────────────────────────────────

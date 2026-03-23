@@ -16,12 +16,17 @@ logger = logging.getLogger(__name__)
 def post_process_notes(treble: List[dict], bass: List[dict],
                        tempo: float, time_sig: list) -> tuple:
     """Main entry point. Returns (treble, bass) after all refinements."""
-    treble = merge_close_notes(treble)
-    bass   = merge_close_notes(bass)
+    # Merge only identical-pitch notes with tiny gap (≤30ms) — never merge different pitches
+    treble = merge_close_notes(treble, max_gap_sec=0.03)
+    bass   = merge_close_notes(bass,   max_gap_sec=0.03)
 
     treble = smooth_melodic_contour(treble)
 
-    bass = fill_sparse_bass(bass, treble, tempo, time_sig)
+    # Fill waltz left-hand pattern when time_sig is 3/4
+    if time_sig[0] == 3:
+        bass = fill_waltz_pattern(bass, treble, tempo, time_sig)
+    else:
+        bass = fill_sparse_bass(bass, treble, tempo, time_sig)
 
     treble, bass = fix_repetitions(treble, bass, tempo, time_sig)
 
@@ -32,7 +37,7 @@ def post_process_notes(treble: List[dict], bass: List[dict],
 # Step 1: Merge same-pitch notes separated by a short gap
 # ──────────────────────────────────────────────────────────────────────────────
 
-def merge_close_notes(notes: List[dict], max_gap_sec: float = 0.12) -> List[dict]:
+def merge_close_notes(notes: List[dict], max_gap_sec: float = 0.03) -> List[dict]:
     """Merge same-pitch notes whose gap is ≤ max_gap_sec (default 120 ms)."""
     if not notes:
         return notes
@@ -158,6 +163,155 @@ def fill_sparse_bass(bass: List[dict], treble: List[dict],
         bass = sorted(bass + inferred, key=lambda n: (n["startTime"], n["pitch"]))
 
     return bass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3b: Waltz pattern fill (3/4 time)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Chord tones for each scale degree root (relative semitones for major triad)
+_MAJOR_TRIAD = [0, 4, 7]
+# Common chord roots by scale degree (0=I, 2=II, 4=III, 5=IV, 7=V, 9=VI, 11=VII)
+_CHORD_TONE_OFFSETS = {
+    0: [0, 4, 7],   # I major
+    2: [2, 5, 9],   # II minor
+    4: [4, 7, 11],  # III minor
+    5: [5, 9, 0],   # IV major
+    7: [7, 11, 2],  # V major
+    9: [9, 0, 4],   # VI minor
+    11: [11, 2, 5], # VII diminished
+}
+
+
+def fill_waltz_pattern(bass: List[dict], treble: List[dict],
+                       tempo: float, time_sig: list) -> List[dict]:
+    """
+    Enforce / repair the waltz "oom-pah-pah" left-hand pattern for 3/4 pieces.
+
+    For each measure:
+      Beat 1 — single bass note (root of the implied chord)
+      Beat 2 — two-note mid-range chord
+      Beat 3 — two-note mid-range chord (same chord as beat 2)
+
+    Strategy:
+    1. Identify existing beat-1 bass notes (they anchor the harmony)
+    2. Fill missing beat-1 notes from the treble's lowest pitch in that measure
+    3. Fill missing beats 2+3 from the inferred chord of the beat-1 note
+    """
+    if not treble:
+        return bass
+
+    beat_dur    = 60.0 / tempo
+    measure_dur = time_sig[0] * beat_dur
+    piece_end   = max(
+        (n["startTime"] + n["duration"] for n in treble + bass),
+        default=0.0,
+    )
+    if piece_end <= 0:
+        return bass
+
+    # Index existing bass notes by measure
+    def measure_idx(t: float) -> int:
+        return int(t / measure_dur)
+
+    bass_by_measure: dict = {}
+    for n in bass:
+        idx = measure_idx(n["startTime"])
+        bass_by_measure.setdefault(idx, []).append(n)
+
+    treble_by_measure: dict = {}
+    for n in treble:
+        idx = measure_idx(n["startTime"])
+        treble_by_measure.setdefault(idx, []).append(n)
+
+    total_measures = int(piece_end / measure_dur) + 1
+    new_notes: List[dict] = list(bass)  # start from existing bass
+
+    for m in range(total_measures):
+        t_beat1 = m * measure_dur
+        t_beat2 = t_beat1 + beat_dur
+        t_beat3 = t_beat1 + 2 * beat_dur
+        existing = bass_by_measure.get(m, [])
+
+        # ── Determine beat-1 root ──────────────────────────────────────────
+        beat1_notes = [n for n in existing
+                       if abs(n["startTime"] - t_beat1) < beat_dur * 0.4]
+        if beat1_notes:
+            root_pitch = min(n["pitch"] for n in beat1_notes)
+        else:
+            # Infer from lowest treble note in this measure
+            t_notes = treble_by_measure.get(m, [])
+            if not t_notes:
+                continue
+            lowest_treble = min(n["pitch"] for n in t_notes)
+            root_pitch = lowest_treble
+            # Transpose to bass register (MIDI 36-52)
+            while root_pitch > 52:
+                root_pitch -= 12
+            while root_pitch < 28:
+                root_pitch += 12
+            # Add inferred beat-1 note if missing
+            new_notes.append({
+                "pitch": root_pitch,
+                "startTime": round(t_beat1, 3),
+                "duration": round(beat_dur * 0.85, 3),
+                "velocity": 65,
+            })
+
+        # ── Fill beats 2 and 3 if missing ─────────────────────────────────
+        beat23_notes = [n for n in existing
+                        if n["startTime"] > t_beat1 + beat_dur * 0.3]
+        if beat23_notes:
+            continue  # beats 2+3 already present
+
+        # Build a two-note mid-range chord from the root
+        # Chord tones: major third above root + perfect fifth above root
+        root_pc = root_pitch % 12
+        # Find the closest scale-degree chord offsets
+        best_key = min(_CHORD_TONE_OFFSETS.keys(),
+                       key=lambda k: min((root_pc - k) % 12,
+                                         (k - root_pc) % 12))
+        offsets = _CHORD_TONE_OFFSETS[best_key][1:]  # skip root, take 3rd and 5th
+        chord_pitches = []
+        for off in offsets:
+            p = (root_pitch // 12) * 12 + off
+            if p <= root_pitch:
+                p += 12
+            # Keep in mid-range (48-64)
+            while p > 64:
+                p -= 12
+            while p < 48:
+                p += 12
+            chord_pitches.append(p)
+
+        if len(chord_pitches) < 2:
+            continue
+
+        for beat_t in (t_beat2, t_beat3):
+            if beat_t >= piece_end:
+                break
+            for cp in chord_pitches:
+                new_notes.append({
+                    "pitch": cp,
+                    "startTime": round(beat_t, 3),
+                    "duration": round(beat_dur * 0.80, 3),
+                    "velocity": 55,
+                })
+
+    # Deduplicate: remove generated notes that clash with existing ones (<50ms apart, same pitch)
+    existing_set = {(round(n["startTime"], 2), n["pitch"]) for n in bass}
+    filtered = []
+    for n in new_notes:
+        key = (round(n["startTime"], 2), n["pitch"])
+        if key not in existing_set or n in bass:
+            filtered.append(n)
+            existing_set.add(key)
+
+    result = sorted(filtered, key=lambda n: (n["startTime"], n["pitch"]))
+    added = len(result) - len(bass)
+    if added > 0:
+        logger.info(f"  Waltz pattern: added {added} left-hand notes")
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
